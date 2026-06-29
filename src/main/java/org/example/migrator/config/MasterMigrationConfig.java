@@ -5,6 +5,8 @@ import com.mongodb.client.MongoCursor;
 import org.bson.Document;
 import org.example.migrator.service.SchemaDiscoveryService;
 import org.example.migrator.util.Utils;
+import org.postgresql.copy.CopyManager;
+import org.postgresql.core.BaseConnection;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.job.builder.JobBuilder;
@@ -12,16 +14,16 @@ import org.springframework.batch.core.job.builder.SimpleJobBuilder;
 import org.springframework.batch.core.repository.JobRepository;
 import org.springframework.batch.core.step.builder.StepBuilder;
 import org.springframework.batch.item.ItemReader;
-import org.springframework.batch.item.database.JdbcBatchItemWriter;
-import org.springframework.batch.item.database.builder.JdbcBatchItemWriterBuilder;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.batch.item.ItemWriter;
 import javax.sql.DataSource;
+import java.io.StringReader;
+import java.sql.Connection;
 import java.util.*;
 
 @Configuration
@@ -57,29 +59,18 @@ public class MasterMigrationConfig {
     }
 
     public Step buildPurelyDynamicStep(String collectionName, JobRepository jr, PlatformTransactionManager tm) {
+
         ensurePostgresTableExists(collectionName);
+
         Map<String, String> columnTypes = schemaDiscoveryService.getTableSchema(collectionName);
-        if (columnTypes.isEmpty()) {
-            throw new IllegalArgumentException(String.format(
-                    "Could not discover schema for table '%s'. Please check if the table exists in PostgresSQL and is in the 'public' schema.",
-                    collectionName
-            ));
-        }
-        String trueInsertSql = Utils.generateInsertSqlFromSchema(collectionName, columnTypes.keySet());
+        List<String> orderedColumns = new ArrayList<>(columnTypes.keySet());
 
-        JdbcBatchItemWriter<Map<String, Object>> writer = new JdbcBatchItemWriterBuilder<Map<String, Object>>()
-                .dataSource(dataSource)
-                .sql(trueInsertSql)
-                .itemSqlParameterSourceProvider(MapSqlParameterSource::new)
-                .build();
-
-        try { writer.afterPropertiesSet(); } catch (Exception e) { throw new RuntimeException(e); }
-
-        return new StepBuilder(collectionName + "MigrationStep", jr).<Document, Map<String, Object>>chunk(1000, tm)
+        return new StepBuilder(collectionName + "MigrationStep", jr)
+                .<Document, Map<String, Object>>chunk(20000, tm)
                 .reader(createMongoStreamingReader(collectionName))
                 .processor(bsonDoc -> {
                     Map<String, Object> sqlData = new HashMap<>();
-                    for (String column : columnTypes.keySet()) {
+                    for (String column : orderedColumns) {
                         sqlData.put(column, null);
                     }
                     for (String key : bsonDoc.keySet()) {
@@ -91,8 +82,42 @@ public class MasterMigrationConfig {
                     }
                     return sqlData;
                 })
-                .writer(writer)
+                .writer(createPostgresCopyWriter(collectionName, orderedColumns))
                 .build();
+    }
+
+    private ItemWriter<Map<String, Object>> createPostgresCopyWriter(String tableName, List<String> columns) {
+        return chunk -> {
+            if (chunk.isEmpty()) return;
+
+            StringBuilder sb = new StringBuilder();
+            for (Map<String, Object> row : chunk.getItems()) {
+                for (int i = 0; i < columns.size(); i++) {
+                    Object val = row.get(columns.get(i));
+
+                    if (val == null) {
+                        sb.append("\\N");
+                    } else {
+                        String strVal = val.toString().replace("\t", " ").replace("\n", " ").replace("\r", " ");
+                        sb.append(strVal);
+                    }
+
+                    if (i < columns.size() - 1) {
+                        sb.append("\t");
+                    }
+                }
+                sb.append("\n");
+            }
+            try (Connection conn = dataSource.getConnection()) {
+                BaseConnection pgConn = conn.unwrap(BaseConnection.class);
+                CopyManager copyManager = new CopyManager(pgConn);
+                String copySql = String.format("COPY %s (%s) FROM STDIN WITH NULL AS '\\N'", tableName, String.join(", ", columns));
+
+                try (StringReader reader = new StringReader(sb.toString())) {
+                    copyManager.copyIn(copySql, reader);
+                }
+            }
+        };
     }
 
     private void ensurePostgresTableExists(String collectionName) {
@@ -125,7 +150,7 @@ public class MasterMigrationConfig {
             private MongoCursor<Document> cursor = null;
 
             @Override
-            public org.bson.Document read() {
+            public Document read() {
                 if (cursor == null) {
                     MongoCollection<Document> collection = mongoTemplate.getDb().getCollection(collectionName);
                     cursor = collection.find().batchSize(1000).iterator();

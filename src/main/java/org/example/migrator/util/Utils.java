@@ -1,8 +1,5 @@
 package org.example.migrator.util;
 
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.List;
 import java.util.Map;
 
 public final class Utils {
@@ -35,19 +32,6 @@ public final class Utils {
             default:
                 return value;
         }
-    }
-
-    public static String generateInsertSqlFromSchema(String tableName, Collection<String> columns) {
-        List<String> colList = new ArrayList<>(columns);
-        List<String> placeholders = colList.stream()
-                .map(col -> ":" + col)
-                .toList();
-        return String.format(
-                "INSERT INTO %s (%s) VALUES (%s) ON CONFLICT (id) DO NOTHING",
-                tableName,
-                String.join(", ", colList),
-                String.join(", ", placeholders)
-        );
     }
 
     public static String determinePostgresType(Object value) {
